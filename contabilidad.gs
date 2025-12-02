@@ -2,106 +2,178 @@
 const SHEET_ID   = '1_PwBusbpQRsGLX4eEYopnywNPTVUvTakHw4C3bz9UwQ';
 const SHEET_NAME = 'Contabilidad_google_test';
 
-const TARGET_SENDER = 'colpatriaInforma@scotiabankcolpatria.com';
+const TARGET_SENDER  = 'cristianespinel95@gmail.com';
 const TARGET_SUBJECT = 'Scotiabank Colpatria en Linea';
 const LABEL_NAME     = 'ColpatriaProcesado';
+
+const BOT_TOKEN = '8001713864:AAFv7iWxWsJjlpIuK4-4Z8ygRAuwWAriq5o';
+const CHAT_ID   = '1361338955';
 // -----------------------------------
 
+// ==========================================
+// 1. PROCESAMIENTO DE EMAILS (GMAIL -> SHEET)
+// ==========================================
 function checkNewColpatriaEmails() {
-  const query = `from:${TARGET_SENDER} subject:"${TARGET_SUBJECT}" is:unread  -label:${LABEL_NAME}`;
-  const threads = GmailApp.search(query, 0, 10); // máx 10 hilos por ejecución
+  const query = `from:${TARGET_SENDER} subject:"${TARGET_SUBJECT}" is:unread -label:${LABEL_NAME}`;
+  const threads = GmailApp.search(query, 0, 10); 
 
-  const label = getOrCreateLabel(LABEL_NAME);
+  if (threads.length === 0) return;
+
   const ss    = SpreadsheetApp.openById(SHEET_ID);
   const sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) throw new Error(`Sheet "${SHEET_NAME}" not found`);
 
+  const label = getOrCreateLabel(LABEL_NAME);
+
   threads.forEach(t => {
-  if (threadHasLabel_(t, LABEL_NAME)) return;
+    // Doble verificación para evitar procesar hilos ya etiquetados si el índice de Gmail tarda en actualizar
+    if (threadHasLabel_(t, LABEL_NAME)) return;
 
-  t.getMessages().forEach(msg => {
-    if (msg.isDraft()) return;
+    const messages = t.getMessages();
+    messages.forEach(msg => {
+      if (msg.isDraft()) return;
+      
+      const body = msg.getPlainBody();
+      // Usamos matchAll por si hay múltiples transacciones en un solo correo (raro, pero posible)
+      const transactions = parseBodyMultiple_(body); 
+      
+      transactions.forEach(row => {
+        sheet.appendRow(row);
+        const currentRowIndex = sheet.getLastRow(); // Obtenemos el índice exacto recién creado
+        
+        // Enviamos notificación pasando el índice exacto
+        notifyTelegram(row, currentRowIndex);
+        console.log('Fila agregada:', row);
+      });
+    });
 
-    const body = msg.getPlainBody();
-    const row  = parseBody_(body);
-    if (row) {
-      sheet.appendRow(row);
-      const [comercio, montoNum, fecha, hora] = row;
-      notifyTelegram([comercio, montoNum, fecha, hora], sheet, sheet.getLastRow());
-      console.log('Row appended:', row);
+    t.addLabel(label); 
+    t.markRead(); // Opcional: marcar como leído en Gmail
+  });
+}
+
+// ==========================================
+// 2. PROCESAMIENTO DE TELEGRAM (TODO EN UNO)
+// ==========================================
+function processTelegramUpdates() {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`;
+  
+  // Obtenemos el último offset procesado para no leer mensajes viejos repetidamente
+  const props = PropertiesService.getScriptProperties();
+  let lastOffset = parseInt(props.getProperty('LAST_OFFSET') || '0');
+  
+  const payload = {
+    offset: lastOffset + 1,
+    limit: 20 // Procesamos hasta 20 acciones de golpe
+  };
+
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    payload: payload,
+    muteHttpExceptions: true
+  });
+  
+  const obj = JSON.parse(res.getContentText());
+  if (!obj.ok || !obj.result || obj.result.length === 0) return;
+
+  // Abrimos la hoja UNA sola vez para todo el lote
+  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
+  let maxUpdateId = lastOffset;
+
+  // --- BUCLE PARA PROCESAR CADA MENSAJE PENDIENTE ---
+  obj.result.forEach(update => {
+    maxUpdateId = update.update_id;
+
+    // A) CASO: Click en Botón (Callback Query)
+    if (update.callback_query) {
+      handleButtonPress(update.callback_query);
+    } 
+    // B) CASO: Respuesta de Texto (Reply)
+    else if (update.message && update.message.reply_to_message) {
+      handleTextReply(update.message, sheet);
     }
   });
 
-  t.addLabel(label);  // <- etiquetamos todo el hilo
-});
+  // Guardamos el nuevo offset para la próxima ejecución
+  props.setProperty('LAST_OFFSET', maxUpdateId.toString());
 }
 
-// ---------------- HELPERS ----------------
-function getOrCreateLabel(name) {
-  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
-}
+// --- MANEJO DE BOTONES ---
+function handleButtonPress(cb) {
+  const data = cb.data; // "card|123" o "cat|123"
+  const chatId = cb.from.id.toString();
 
-function threadHasLabel_(thread, labelName) {
-  return thread.getLabels().some(l => l.getName() === labelName);
-}
+  if (chatId !== CHAT_ID) return;
 
-function parseBody_(body) {
-  const regex = /([A-Z0-9ÁÉÍÓÚÜÑ\-\s]+)\s+([\d,.]+)\s+(\d{4}\/\d{2}\/\d{2})\s+(\d{2}:\d{2}:\d{2})/gm;
-  let m = regex.exec(body);
-  if (!m) return null;
+  const [type, rowIdx] = data.split('|');
+  
+  // Guardamos en memoria QUÉ está editando el usuario.
+  // Clave: "PENDING_1361338955" -> Valor: "card|123"
+  PropertiesService.getScriptProperties().setProperty(`PENDING_${chatId}`, data);
 
-  const [_, comercio, montoTxt, fecha, hora] = m;
-  const montoNum = parseFloat(montoTxt.replace(/,/g, ''));
-  return [comercio.trim(), montoNum, fecha, hora];
-}
+  const question = type === 'card' 
+    ? `💳 Editando Fila ${rowIdx}: ¿Últimos 4 dígitos?` 
+    : `📂 Editando Fila ${rowIdx}: ¿Categoría?`;
 
-// ---------- TRIGGER ----------
-function createTimeTrigger() {
-  // Borra triggers duplicados
-  ScriptApp.getProjectTriggers()
-           .filter(t => t.getHandlerFunction() === 'checkNewColpatriaEmails')
-           .forEach(t => ScriptApp.deleteTrigger(t));
-
-  // Crea uno que corra cada 5 minutos
-  ScriptApp.newTrigger('checkNewColpatriaEmails')
-           .timeBased()
-           .everyMinutes(5)
-           .create();
-}
-// ---------- TRIGGER TELEGRAM ----------
-/**function setTriggers() {
-  // Trigger para procesar respuestas de Telegram cada minuto
-  if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'processTelegramAnswers')) {
-    ScriptApp.newTrigger('processTelegramAnswers')
-             .timeBased()
-             .everyMinutes(30)
-             .create();
-  }
-}**/
-function setTelegramPermanents() {
-  // borra activadores viejos
-  ['processTelegramAnswers', 'captureReply'].forEach(fn => {
-    ScriptApp.getProjectTriggers()
-             .filter(t => t.getHandlerFunction() === fn)
-             .forEach(t => ScriptApp.deleteTrigger(t));
+  // 1. Respondemos a Telegram para quitar el relojito (IMPORTANTE)
+  UrlFetchApp.fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+    method: 'post',
+    payload: { callback_query_id: cb.id }
   });
 
-  // crea los dos activadores PERMANENTES cada 2 min
-  ScriptApp.newTrigger('processTelegramAnswers').timeBased().everyMinutes(5).create();
-  ScriptApp.newTrigger('captureReply')        .timeBased().everyMinutes(5).create();
+  // 2. Enviamos la pregunta forzando respuesta
+  UrlFetchApp.fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: 'post',
+    payload: {
+      chat_id: CHAT_ID,
+      text: question,
+      reply_markup: JSON.stringify({ force_reply: true, selective: true })
+    }
+  });
 }
 
-//CONFIG TELEGRAM
+// --- MANEJO DE RESPUESTAS DE TEXTO ---
+function handleTextReply(msg, sheet) {
+  const chatId = msg.from.id.toString();
+  const text = msg.text;
 
-const BOT_TOKEN = '8001713864:AAFv7iWxWsJjlpIuK4-4Z8ygRAuwWAriq5o';   // <-- token que te dio BotFather
-const CHAT_ID   = '1361338955';           // <-- tu chatId personal
+  // Recuperamos qué estaba editando el usuario
+  const pendingAction = PropertiesService.getScriptProperties().getProperty(`PENDING_${chatId}`);
+  
+  if (!pendingAction) {
+    sendTG("⚠️ No sé a qué transacción corresponde esto. Pulsa el botón de nuevo.");
+    return;
+  }
 
-/****************************************************************
- * ENVÍA NOTIFICACIÓN CON BOTONES
- ***************************************************************/
-function notifyTelegram(rowData, sheet, rowIndex) {
+  const [type, rowIdx] = pendingAction.split('|');
+  const rowIndex = parseInt(rowIdx);
+
+  // Validamos que la fila exista (por seguridad)
+  if (rowIndex > sheet.getLastRow()) {
+     sendTG("❌ Error: La fila ya no parece existir.");
+     return;
+  }
+
+  if (type === 'card') {
+    sheet.getRange(rowIndex, 5).setValue(text); // Columna 5: Tarjeta
+    sendTG(`✅ Tarjeta actualizada en fila ${rowIndex}: ${text}`);
+  } else if (type === 'cat') {
+    sheet.getRange(rowIndex, 6).setValue(text); // Columna 6: Categoría
+    sendTG(`✅ Categoría actualizada en fila ${rowIndex}: ${text}`);
+  }
+
+  // Limpiamos la memoria
+  PropertiesService.getScriptProperties().deleteProperty(`PENDING_${chatId}`);
+}
+
+// ==========================================
+// 3. UTILIDADES Y TRIGGERS
+// ==========================================
+
+function notifyTelegram(rowData, rowIndex) {
   const [comercio, monto, fecha, hora] = rowData;
-
+  
+  // Guardamos el rowIndex en el botón
   const kb = {
     inline_keyboard: [[
       {text: '🔢 Nº Tarjeta', callback_data: `card|${rowIndex}`},
@@ -113,240 +185,88 @@ function notifyTelegram(rowData, sheet, rowIndex) {
     `💳 *Nueva compra detectada*\n` +
     `• Comercio: *${comercio}*\n` +
     `• Monto: *$${monto.toLocaleString()}*\n` +
-    `• Fecha: *${fecha} ${hora}*\n\n` +
-    `👉 Pulsa los botones para rellenar tarjeta y categoría.`;
+    `• Fecha: *${fecha} ${hora}*\n` +
+    `• Fila ID: *${rowIndex}*`; // Útil para depurar
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  const payload = {
-    chat_id: CHAT_ID,
-    text: text,
-    parse_mode: 'Markdown',
-    reply_markup: JSON.stringify(kb)
-  };
-
-  UrlFetchApp.fetch(url, {method: 'post', payload});
-}
-
-/****************************************************************
- * PROCESA LAS RESPUESTAS (WEBHOOK-LITE)
- *   – Lo más simple: poll cada X minutos
- ***************************************************************/
-function processTelegramAnswers() {
-  const url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/getUpdates';
-  const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  const obj = JSON.parse(res.getContentText());
-  if (!obj.ok || !obj.result.length) return;
-
-  const upd = obj.result[0];
-  const data = upd.callback_query?.data;        // "card|123"  o  "cat|123"
-  const userId = upd.callback_query?.from?.id.toString();
-
-  if (!data || userId !== CHAT_ID) return;
-
-  const [type, rowIdx] = data.split('|');
-  const question = type === 'card'
-        ? '¿Últimos 4 dígitos de la tarjeta?'
-        : '¿Categoría? (Ej: Alimentación, Transporte, etc.)';
-
-  // 1. Pregunta al usuario
-  UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage', {
+  UrlFetchApp.fetch(url, {
     method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify({
+    payload: {
       chat_id: CHAT_ID,
-      text: question,
-      reply_markup: { force_reply: true }
-    })
+      text: text,
+      parse_mode: 'Markdown',
+      reply_markup: JSON.stringify(kb)
+    }
   });
-
-  // 2. Confirma el botón (evita el relojito girando)
-  UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/answerCallbackQuery', {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify({ callback_query_id: upd.callback_query.id })
-  });
-
-  // 3. Borra el update de la cola
-  UrlFetchApp.fetch(url + '?offset=' + (upd.update_id + 1));
-}
-
-function captureReply() {
-  const url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/getUpdates';
-  const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  const obj = JSON.parse(res.getContentText());
-  if (!obj.ok || !obj.result.length) return;
-
-  // tomamos el último mensaje
-  const upd = obj.result[obj.result.length - 1];
-  const txt = upd.message?.text;
-  const reply = upd.message?.reply_to_message?.text;
-
-  if (!txt || !reply) return;
-
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const lastRow = sheet.getLastRow();
-
-  if (reply.includes('tarjeta')) {
-    sheet.getRange(lastRow, 5).setValue(txt);
-    sendTG('✅ Nº de tarjeta guardado: ' + txt);
-  } else if (reply.includes('Categoría')) {
-    sheet.getRange(lastRow, 6).setValue(txt);
-    sendTG('✅ Categoría guardada: ' + txt);
-  }
-
-  // borra el update para no repetir
-  UrlFetchApp.fetch(url + '?offset=' + (upd.update_id + 1));
 }
 
 function sendTG(text) {
-  UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage', {
+  UrlFetchApp.fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify({ chat_id: CHAT_ID, text: text })
+    payload: { chat_id: CHAT_ID, text: text }
   });
 }
 
-function testOneEmail() {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const row = ['MERCADOPAGO', 9428, '2025/09/04', '21:30:00'];
-  sheet.appendRow(row);
-  notifyTelegram(row, sheet, sheet.getLastRow());
-  console.log('Fila y notificación forzadas');
-}
-
-function testRegex() {
-  const body = ` 
-
-
-`;
-
-  const regex = /COMERCIO\s+MONTO\s+FECHA\s+HORA\s*\n([A-Z0-9ÁÉÍÓÚÜÑ\-\s]+)\s+([\d,.]+)\s+(\d{4}\/\d{2}\/\d{2})\s+(\d{2}:\d{2}:\d{2})/gm;
-  let lastMatch;
+// Helper: Extrae TODAS las coincidencias del cuerpo, no solo la primera
+function parseBodyMultiple_(body) {
+  const regex = /([A-Z0-9ÁÉÍÓÚÜÑ\-\s]+)\s+([\d,.]+)\s+(\d{4}\/\d{2}\/\d{2})\s+(\d{2}:\d{2}:\d{2})/gm;
+  const results = [];
   let m;
-  while ((m = regex.exec(body)) !== null) lastMatch = m;
-
-  console.log('¿Match encontrado?', !!lastMatch);
-  if (lastMatch) console.log('Array completo:', lastMatch);
+  while ((m = regex.exec(body)) !== null) {
+    const [_, comercio, montoTxt, fecha, hora] = m;
+    const montoNum = parseFloat(montoTxt.replace(/,/g, ''));
+    results.push([comercio.trim(), montoNum, fecha, hora]);
+  }
+  return results;
 }
 
+function getOrCreateLabel(name) {
+  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
+}
 
-function logFirstEmailBody() {
-  const query = `from:${TARGET_SENDER} subject:"${TARGET_SUBJECT}"`;
-  const threads = GmailApp.search(query, 0, 1);
-  if (threads.length === 0) {
-    console.log('No se encontraron correos con el remitente y asunto especificados.');
+function threadHasLabel_(thread, labelName) {
+  return thread.getLabels().some(l => l.getName() === labelName);
+}
+
+// ==========================================
+// 4. CONFIGURACIÓN DE ACTIVADORES
+// ==========================================
+function setAllTriggers() {
+  // Borrar todos los triggers anteriores para limpiar
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => ScriptApp.deleteTrigger(t));
+
+  // 1. Revisar correos cada 5 minutos
+  ScriptApp.newTrigger('checkNewColpatriaEmails')
+           .timeBased().everyMinutes(5).create();
+
+  // 2. Revisar Telegram cada 1 minuto (Lo más rápido permitido por triggers simples)
+  // Nota: Para velocidad real, necesitarías Webhooks (doPost), pero esto mejora mucho la versión actual.
+  ScriptApp.newTrigger('processTelegramUpdates')
+           .timeBased().everyMinutes(1).create();
+           
+  console.log("Activadores configurados correctamente.");
+}
+function FORCE_CLEAR_TELEGRAM_QUEUE() {
+  // Asegúrate de que BOT_TOKEN esté definido arriba en tu código
+  const url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/getUpdates';
+  
+  // 1. Pedimos todo lo pendiente
+  const res = UrlFetchApp.fetch(url);
+  const data = JSON.parse(res.getContentText());
+  
+  if (data.result.length === 0) {
+    console.log("✅ La cola de Telegram ya está vacía. No hay mensajes atascados.");
     return;
   }
-
-  const firstThread = threads[0];
-  const firstMessage = firstThread.getMessages()[0];
-  const body = firstMessage.getPlainBody();
-
-  console.log('------------------ INICIO DEL CUERPO DEL EMAIL ------------------');
-  console.log(body);
-  console.log('------------------- FIN DEL CUERPO DEL EMAIL --------------------');
+  
+  // 2. Buscamos el ID del último mensaje
+  const lastUpdateId = data.result[data.result.length - 1].update_id;
+  
+  // 3. Hacemos una petición con offset + 1 para confirmar lectura de TODO
+  // Esto le dice a Telegram: "Olvida todo lo anterior a este número"
+  const clearUrl = url + '?offset=' + (lastUpdateId + 1);
+  UrlFetchApp.fetch(clearUrl);
+  
+  console.log(`🗑️ Se han eliminado ${data.result.length} mensajes atascados de la cola.`);
 }
-
-function parseCorreo(correo) {
-  const bancos = [
-    {
-      nombre: "Scotiabank Colpatria",
-      remitente: /scotiabank|colpatria/i,
-      asunto: /Scotiabank Colpatria/i,
-      regex: /COMERCIO\s+MONTO\s+FECHA\s+HORA\s*\n([A-Z0-9ÁÉÍÓÚÜÑ\-\s]+)\s+([\d,.]+)\s+(\d{4}\/\d{2}\/\d{2})\s+(\d{2}:\d{2}:\d{2})/m,
-      map: (m) => ({
-        comercio: m[1],
-        monto: m[2],
-        fecha: m[3],
-        hora: m[4],
-      }),
-    },
-    {
-      nombre: "Bancolombia",
-      remitente: /bancolombia\.com\.co/i,
-      asunto: /Alertas y Notificaciones/i,
-      regex: /Transferiste\s+\$([\d,.]+).*?\*([\d]+).*?\*([\d]+)\s+el\s+(\d{2}\/\d{2}\/\d{4})\s+a\s+las\s+(\d{2}:\d{2})/m,
-      map: (m) => ({
-        monto: m[1],
-        cuenta_origen: m[2],
-        cuenta_destino: m[3],
-        fecha: m[4],
-        hora: m[5],
-      }),
-    },
-    {
-      nombre: "BBVA",
-      remitente: /bbva/i,
-      asunto: /Compra Exitosa/i,
-      regex: /Tarjeta terminada en:\s*\*([\d]+).*?Fecha.*?:\s*(\d{4}-\d{2}-\d{2}).*?Establecimiento:\s*([^\n]+).*?Valor:\s*\$([\d,.]+).*?Hora:\s*(\d{2}:\d{2})/ms,
-      map: (m) => ({
-        tarjeta: m[1],
-        fecha: m[2],
-        comercio: m[3],
-        monto: m[4],
-        hora: m[5],
-      }),
-    },
-    {
-      nombre: "Davivienda",
-      remitente: /davivienda\.com/i,
-      asunto: /DAVIVIENDA/i,
-      regex: /Fecha:(\d{4}\/\d{2}\/\d{2}).*?Hora:(\d{2}:\d{2}:\d{2}).*?Valor Transacción:\s*\$([\d,.]+).*?Clase de Movimiento:\s*([^\n]+).*?Lugar de Transacción:\s*([^\n]+)/ms,
-      map: (m) => ({
-        fecha: m[1],
-        hora: m[2],
-        monto: m[3],
-        movimiento: m[4],
-        lugar: m[5],
-      }),
-    },
-    {
-      nombre: "PSE",
-      remitente: /achcolombia\.com\.co/i,
-      asunto: /PSE Transacción Aprobada/i,
-      regex: /Estado.*?:\s*([^\n]+).*?CUS:\s*(\d+).*?Empresa:\s*([^\n]+).*?Valor de la Transacción:\s*\$?\s*([\d,.]+).*?Fecha.*?:\s*(\d{2}\/\d{2}\/\d{4})/ms,
-      map: (m) => ({
-        estado: m[1],
-        cus: m[2],
-        empresa: m[3],
-        monto: m[4],
-        fecha: m[5],
-      }),
-    },
-  ];
-
-  for (let banco of bancos) {
-    if (banco.remitente.test(correo.remitente) && banco.asunto.test(correo.asunto)) {
-      const m = banco.regex.exec(correo.body);
-      if (m) {
-        return {
-          banco: banco.nombre,
-          remitente: correo.remitente,
-          asunto: correo.asunto,
-          ...banco.map(m),
-        };
-      }
-    }
-  }
-
-  return null; // No se identificó
-}
-
-// Ejemplo de uso
-const correo = {
-  remitente: "BBVA@bbvanet.com.co",
-  asunto: "Compra Exitosa",
-  body: `Ref:12250553
- 
-En BBVA nos transformamos para poner en tus manos todas las oportunidades del mundo. A continuación encuentras el comprobante de la transacción que realizaste.
- 
-Detalles de la operación:  
-Tarjeta terminada en: *6156
-Fecha de la operación: 2025-08-27
-Establecimiento: Mercado pago*merc
-Valor: $809,910.00
-Hora: 11:02
-Gracias por utilizar nuestros Canales Transaccionales. Como medida adicional de seguridad te recordamos la importancia de cambiar periódicamente tus claves de accesos a todos nuestros canales.`
-};
-
-console.log(parseCorreo(correo));
