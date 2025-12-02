@@ -238,7 +238,7 @@ function setAllTriggers() {
 
   // 1. Revisar correos cada 5 minutos
   ScriptApp.newTrigger('checkNewColpatriaEmails')
-           .timeBased().everyMinutes(5).create();
+           .timeBased().everyMinutes(1).create();
 
   // 2. Revisar Telegram cada 1 minuto (Lo más rápido permitido por triggers simples)
   // Nota: Para velocidad real, necesitarías Webhooks (doPost), pero esto mejora mucho la versión actual.
@@ -246,27 +246,4 @@ function setAllTriggers() {
            .timeBased().everyMinutes(1).create();
            
   console.log("Activadores configurados correctamente.");
-}
-function FORCE_CLEAR_TELEGRAM_QUEUE() {
-  // Asegúrate de que BOT_TOKEN esté definido arriba en tu código
-  const url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/getUpdates';
-  
-  // 1. Pedimos todo lo pendiente
-  const res = UrlFetchApp.fetch(url);
-  const data = JSON.parse(res.getContentText());
-  
-  if (data.result.length === 0) {
-    console.log("✅ La cola de Telegram ya está vacía. No hay mensajes atascados.");
-    return;
-  }
-  
-  // 2. Buscamos el ID del último mensaje
-  const lastUpdateId = data.result[data.result.length - 1].update_id;
-  
-  // 3. Hacemos una petición con offset + 1 para confirmar lectura de TODO
-  // Esto le dice a Telegram: "Olvida todo lo anterior a este número"
-  const clearUrl = url + '?offset=' + (lastUpdateId + 1);
-  UrlFetchApp.fetch(clearUrl);
-  
-  console.log(`🗑️ Se han eliminado ${data.result.length} mensajes atascados de la cola.`);
 }
